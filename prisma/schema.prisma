@@ -1,0 +1,423 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------
+// Enums
+// ----------------------------------------------------
+
+enum ReactorStatus {
+  RUNNING
+  IDLE
+  OFFLINE
+  MAINTENANCE
+  ALARM
+}
+
+enum EquipmentCondition {
+  OPTIMAL
+  GOOD
+  DEGRADED
+  CRITICAL
+  UNKNOWN
+}
+
+enum SensorType {
+  TEMPERATURE
+  PRESSURE
+  MICROWAVE_POWER
+  GAS_FLOW_CH4
+  GAS_FLOW_H2
+  SUBSTRATE_TEMP
+  COOLING_WATER_FLOW
+  VACUUM_LEVEL
+  OPTICAL_EMISSION
+}
+
+enum SensorStatus {
+  ONLINE
+  OFFLINE
+  CALIBRATING
+  ERROR
+  STALE
+}
+
+enum GatewayStatus {
+  CONNECTED
+  DISCONNECTED
+  DEGRADED
+}
+
+enum AlarmSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum AlarmStatus {
+  ACTIVE
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+enum WorkOrderStatus {
+  OPEN
+  ASSIGNED
+  IN_PROGRESS
+  PENDING_PARTS
+  RESOLVED
+  CLOSED
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum UserRole {
+  ADMIN
+  ENGINEER
+  TECHNICIAN
+  OPERATOR
+}
+
+// ----------------------------------------------------
+// A. Overview & Hierarchy
+// ----------------------------------------------------
+
+model Site {
+  id          String    @id @default(cuid())
+  name        String
+  code        String    @unique
+  city        String
+  state       String
+  country     String    @default("India")
+  timezone    String    @default("Asia/Kolkata")
+  description String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  reactors    Reactor[]
+  gateways    Gateway[]
+
+  @@map("sites")
+}
+
+model Reactor {
+  id              String             @id @default(cuid())
+  siteId          String
+  name            String
+  model           String             // e.g. "MPCVD-915-PRO", "CVD-2450-ULTRA"
+  serialNumber    String             @unique
+  chamberVolumeL  Float              @default(45.0)
+  maxPowerKw      Float              @default(6.0)
+  status          ReactorStatus      @default(IDLE)
+  condition       EquipmentCondition @default(OPTIMAL)
+  healthScore     Float              @default(98.5)
+  installedAt     DateTime           @default(now())
+  lastServicedAt  DateTime?
+  totalRunHours   Float              @default(0.0)
+  isSimulated     Boolean            @default(true)
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  site            Site               @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  sensors         Sensor[]
+  telemetryLogs   TelemetryLog[]
+  faultEvents     FaultEvent[]
+  operatingLimits OperatingLimit[]
+  workOrders      WorkOrder[]
+  inspections     Inspection[]
+  downtimeLogs    DowntimeLog[]
+  auditLogs       AuditLog[]
+
+  @@map("reactors")
+}
+
+// ----------------------------------------------------
+// B. Connectivity & Hardware Layer
+// ----------------------------------------------------
+
+model Gateway {
+  id              String        @id @default(cuid())
+  siteId          String
+  name            String
+  macAddress      String        @unique
+  ipAddress       String?
+  firmwareVersion String        @default("v2.4.1")
+  protocol        String        @default("MQTT / Modbus-TCP")
+  status          GatewayStatus @default(CONNECTED)
+  lastSeenAt      DateTime      @default(now())
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  site            Site          @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  sensors         Sensor[]
+
+  @@map("gateways")
+}
+
+model Sensor {
+  id              String        @id @default(cuid())
+  reactorId       String
+  gatewayId       String?
+  name            String
+  code            String        // e.g. "TC-PLASM-01"
+  type            SensorType
+  unit            String        // "°C", "Torr", "kW", "sccm"
+  status          SensorStatus  @default(ONLINE)
+  lastReading     Float?
+  lastTimestamp   DateTime?
+  calibrationDue  DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  reactor         Reactor       @relation(fields: [reactorId], references: [id], onDelete: Cascade)
+  gateway         Gateway?      @relation(fields: [gatewayId], references: [id], onDelete: SetNull)
+  calibrations    Calibration[]
+
+  @@unique([reactorId, code])
+  @@map("sensors")
+}
+
+model TelemetryLog {
+  id              String   @id @default(cuid())
+  reactorId       String
+  timestamp       DateTime @default(now())
+  temperatureC    Float
+  pressureTorr    Float
+  microwavePowerKw Float
+  ch4FlowSccm     Float
+  h2FlowSccm      Float
+  substrateTempC  Float
+  vacuumLevelMbar Float?
+  coolingFlowLpm  Float?
+  isSimulated     Boolean  @default(false)
+  isValid         Boolean  @default(true)
+  qualityScore    Float    @default(1.0) // 1.0 = valid, 0.5 = jitter, 0 = stale/corrupt
+
+  reactor         Reactor  @relation(fields: [reactorId], references: [id], onDelete: Cascade)
+
+  @@index([reactorId, timestamp(sort: Desc)])
+  @@map("telemetry_logs")
+}
+
+model Calibration {
+  id              String   @id @default(cuid())
+  sensorId        String
+  calibratedAt    DateTime @default(now())
+  technicianName  String
+  standardUsed    String
+  preCalibration  Float
+  postCalibration Float
+  passed          Boolean  @default(true)
+  notes           String?
+
+  sensor          Sensor   @relation(fields: [sensorId], references: [id], onDelete: Cascade)
+
+  @@map("calibrations")
+}
+
+// ----------------------------------------------------
+// C. Reactor Health & Alarms
+// ----------------------------------------------------
+
+model OperatingLimit {
+  id          String     @id @default(cuid())
+  reactorId   String
+  parameter   String     // "plasma_temp", "chamber_pressure", "microwave_power"
+  minNormal   Float
+  maxNormal   Float
+  minWarning  Float
+  maxWarning  Float
+  minCritical Float
+  maxCritical Float
+  unit        String
+  enabled     Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  reactor     Reactor    @relation(fields: [reactorId], references: [id], onDelete: Cascade)
+
+  @@unique([reactorId, parameter])
+  @@map("operating_limits")
+}
+
+model FaultEvent {
+  id              String        @id @default(cuid())
+  reactorId       String
+  code            String        // "E-VAC-04", "E-PLAS-01"
+  title           String
+  description     String
+  severity        AlarmSeverity @default(WARNING)
+  status          AlarmStatus   @default(ACTIVE)
+  rootCause       String?
+  detectedAt      DateTime      @default(now())
+  acknowledgedAt  DateTime?
+  acknowledgedBy  String?
+  resolvedAt      DateTime?
+  resolvedBy      String?
+
+  reactor         Reactor       @relation(fields: [reactorId], references: [id], onDelete: Cascade)
+  workOrders      WorkOrder[]
+
+  @@index([reactorId, detectedAt(sort: Desc)])
+  @@map("fault_events")
+}
+
+// ----------------------------------------------------
+// D. Field Operations & Maintenance
+// ----------------------------------------------------
+
+model WorkOrder {
+  id              String          @id @default(cuid())
+  reactorId       String
+  faultEventId    String?
+  workOrderNumber String          @unique
+  title           String
+  description     String
+  priority        Priority        @default(MEDIUM)
+  status          WorkOrderStatus @default(OPEN)
+  assignedTo      String?
+  scheduledDate   DateTime?
+  completedDate   DateTime?
+  hoursSpent      Float?          @default(0.0)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  reactor         Reactor         @relation(fields: [reactorId], references: [id], onDelete: Cascade)
+  faultEvent      FaultEvent?     @relation(fields: [faultEventId], references: [id], onDelete: SetNull)
+  sparePartsUsed  SparePartUsage[]
+
+  @@map("work_orders")
+}
+
+model Inspection {
+  id          String   @id @default(cuid())
+  reactorId   String
+  inspector   String
+  checkDate   DateTime @default(now())
+  vacuumSeal  Boolean  @default(true)
+  waveguide   Boolean  @default(true)
+  coolingFlow Boolean  @default(true)
+  stageTilt   Boolean  @default(true)
+  gasLines    Boolean  @default(true)
+  overallPass Boolean  @default(true)
+  notes       String?
+
+  reactor     Reactor  @relation(fields: [reactorId], references: [id], onDelete: Cascade)
+
+  @@map("inspections")
+}
+
+model SparePart {
+  id          String          @id @default(cuid())
+  partNumber  String          @unique
+  name        String
+  category    String          // "Seals", "Magnetrons", "MFC Valves", "Optics"
+  stockCount  Int             @default(0)
+  minThreshold Int            @default(2)
+  unitCostInr Float           @default(0.0)
+  location    String          @default("Warehouse A")
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  usages      SparePartUsage[]
+
+  @@map("spare_parts")
+}
+
+model SparePartUsage {
+  id          String    @id @default(cuid())
+  workOrderId String
+  sparePartId String
+  quantity    Int       @default(1)
+  createdAt   DateTime  @default(now())
+
+  workOrder   WorkOrder @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+  sparePart   SparePart @relation(fields: [sparePartId], references: [id], onDelete: Restrict)
+
+  @@map("spare_part_usages")
+}
+
+model DowntimeLog {
+  id          String    @id @default(cuid())
+  reactorId   String
+  startedAt   DateTime
+  endedAt     DateTime?
+  durationMin Int?
+  category    String    // "UNSCHEDULED_BREAKDOWN", "PREVENTIVE_MAINTENANCE", "SEED_PLACEMENT", "VACUUM_PUMPDOWN"
+  reason      String
+  recordedBy  String
+
+  reactor     Reactor   @relation(fields: [reactorId], references: [id], onDelete: Cascade)
+
+  @@map("downtime_logs")
+}
+
+// ----------------------------------------------------
+// E. Platform & Governance
+// ----------------------------------------------------
+
+model DetectionRule {
+  id          String   @id @default(cuid())
+  code        String   @unique // "RULE-TEMP-RUNAWAY"
+  name        String
+  description String
+  parameter   String
+  condition   String   // ">", "<", "ROC_GREATER_THAN"
+  threshold   Float
+  severity    AlarmSeverity @default(WARNING)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("detection_rules")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  title     String
+  message   String
+  type      String   // "ALARM", "MAINTENANCE", "SYSTEM", "CALIBRATION"
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("notifications")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  role      UserRole @default(OPERATOR)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  auditLogs AuditLog[]
+
+  @@map("users")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  reactorId String?
+  action    String   // "UPDATE_LIMIT", "ACKNOWLEDGE_ALARM", "CALIBRATION_APPLIED"
+  details   String
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  reactor   Reactor? @relation(fields: [reactorId], references: [id], onDelete: SetNull)
+
+  @@map("audit_logs")
+}
